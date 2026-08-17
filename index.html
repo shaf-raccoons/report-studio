@@ -423,6 +423,28 @@ input[type=range]:focus-visible::-webkit-slider-thumb{box-shadow:0 0 0 3px hsl(v
 .addsub{margin-left:1.125rem;width:calc(100% - 1.125rem)}
 .treegap{height:.625rem}
 
+/* .docx import + re-import review, docked below the structure tree */
+.docx-import{margin-top:.75rem;padding-top:.75rem;border-top:1px solid hsl(var(--border))}
+.docx-panel{margin-top:.625rem;border:1px solid hsl(var(--border));border-radius:calc(var(--radius) - 2px);overflow:hidden}
+.docx-panel .dp-head{display:flex;align-items:center;gap:.5rem;padding:.5rem .625rem;background:hsl(var(--muted)/.4);font-size:.75rem;font-weight:600}
+.docx-panel .dp-sum{color:hsl(var(--muted-foreground));font-weight:500}
+.docx-panel .dp-list{max-height:15rem;overflow:auto}
+.docx-row{display:flex;align-items:flex-start;gap:.5rem;padding:.4375rem .625rem;border-top:1px solid hsl(var(--border));font-size:.75rem}
+.docx-row .dr-tag{flex:0 0 auto;font-size:.625rem;font-weight:700;text-transform:uppercase;letter-spacing:.03em;padding:.0625rem .3125rem;border-radius:.25rem}
+.docx-row .dr-tag.edited{background:hsl(38 92% 50%/.16);color:hsl(30 90% 38%)}
+.docx-row .dr-tag.added{background:hsl(142 70% 45%/.16);color:hsl(142 60% 32%)}
+.docx-row .dr-tag.removed{background:hsl(0 84% 60%/.14);color:hsl(0 72% 46%)}
+.docx-row .dr-text{min-width:0;flex:1;color:hsl(var(--muted-foreground));overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.docx-row .dr-skip{flex:0 0 auto;width:1.25rem;height:1.25rem;border:0;background:none;color:hsl(var(--muted-foreground));border-radius:.25rem;cursor:pointer;display:grid;place-items:center}
+.docx-row .dr-skip:hover{background:hsl(var(--secondary));color:hsl(var(--foreground))}
+.docx-row.off{opacity:.4}
+.docx-panel .dp-foot{display:flex;gap:.375rem;padding:.5rem .625rem;border-top:1px solid hsl(var(--border))}
+.docx-diag{margin-top:.625rem;display:flex;align-items:center;gap:.5rem;font-size:.75rem;color:hsl(var(--muted-foreground))}
+.docx-diag .dd-badge{font-size:.625rem;font-weight:700;text-transform:uppercase;letter-spacing:.03em;padding:.0625rem .375rem;border-radius:.25rem}
+.docx-diag .dd-badge.low{background:hsl(142 70% 45%/.16);color:hsl(142 60% 32%)}
+.docx-diag .dd-badge.medium{background:hsl(38 92% 50%/.16);color:hsl(30 90% 38%)}
+.docx-diag .dd-badge.high{background:hsl(0 84% 60%/.14);color:hsl(0 72% 46%)}
+
 .menu{position:fixed;z-index:65;min-width:11.5rem;padding:.25rem;display:none;
   border:1px solid hsl(var(--border));border-radius:calc(var(--radius) - 2px);background:hsl(var(--popover));
   color:hsl(var(--popover-foreground));box-shadow:0 8px 24px -8px rgb(0 0 0/.35)}
@@ -1143,6 +1165,12 @@ table.doc thead th{position:relative}
 
     <div class="pane" id="pane-structure">
       <div class="tree" id="tree"></div>
+      <div class="docx-import" id="docxImport">
+        <button class="btn btn-outline btn-sm" id="docxBtn" style="width:100%"><span data-icon="upload"></span> Import from .docx</button>
+        <input type="file" id="docxIn" accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document" hidden>
+        <p class="helptext" id="docxHelp" style="margin:.5rem 0 0">Drop a Word file to populate the report. Re-import an edited version later to merge only the changes.</p>
+        <div id="docxPanel" hidden></div>
+      </div>
     </div>
 
     <div class="pane" id="pane-design" hidden>
@@ -1470,6 +1498,9 @@ table.doc thead th{position:relative}
   </div>
 </div>
 
+<!-- .docx import — mammoth (UMD, exposes window.mammoth). Local vendor file so
+     it stays offline; loaded before the app script so the importer can use it. -->
+<script src="vendor/mammoth.browser.min.js"></script>
 <script>
 "use strict";
 
@@ -3957,6 +3988,418 @@ function sanitizeHtml(html){
   })(doc.body);
   return doc.body.innerHTML.replace(/(\s|&nbsp;)+/g, ' ').trim();
 }
+
+/* ==========================================================================
+   .docx IMPORT — mammoth converts a Word file (Google-Docs export or otherwise)
+   to semantic HTML; the four transforms below turn that into house blocks:
+   styleMap (Word styles -> block types), section split (each H1 = new section),
+   table pass (reuse the paste table machinery), image pass (base64 -> D.images,
+   grouped with its caption). Each block is stamped with a content `fp`
+   (fingerprint) so a later re-import can merge only the deltas — see Phase 2.
+   ========================================================================== */
+
+/* Transform 1 — styleMap: route named Word styles to predictable tags mammoth
+   then emits. Heading 1-5 already map by default; these cover the rest. */
+const DOCX_STYLE_MAP = [
+  "p[style-name='Title'] => h1:fresh",
+  "p[style-name='Heading 1'] => h1:fresh",
+  "p[style-name='Heading 2'] => h2:fresh",
+  "p[style-name='Heading 3'] => h3:fresh",
+  "p[style-name='Heading 4'] => h4:fresh",
+  "p[style-name='Heading 5'] => h5:fresh",
+  "p[style-name='Caption'] => p.caption:fresh",
+  "p[style-name='Quote'] => blockquote:fresh",
+  "p[style-name='Intense Quote'] => blockquote:fresh"
+];
+
+function htmlToText(html){
+  const d = new DOMParser().parseFromString(html || '', 'text/html');
+  return d.body.textContent || '';
+}
+/* plain text of a block, for fingerprinting/matching */
+function blockPlainText(b){
+  switch(b.type){
+    case 'body':  return htmlToText(b.html);
+    case 'h1':    return (b.eyebrow ? b.eyebrow + ' ' : '') + (b.text || '');
+    case 'h2': case 'h3': case 'h4': case 'h5': case 'label': return b.text || '';
+    case 'quote': return (b.text || '') + ' ' + (b.by || '');
+    case 'table': return [b.head || [], ...(b.rows || [])].map(r => (r || []).join(' | ')).join(' \n ');
+    case 'image': case 'chart': return b.caption || '';
+    case 'stat':  return [b.v, b.l, b.note].filter(Boolean).join(' ');
+    case 'stats': return (b.items || []).map(i => i.v + ' ' + i.l).join(' ');
+    case 'blurb': return htmlToText((b.title || '') + ' ' + (b.body || ''));
+    default:      return '';
+  }
+}
+const normText = s => CLEAN(s).toLowerCase();
+/* djb2 — a stable, dependency-free content hash (no crypto needed here) */
+function hashStr(s){ let h = 5381; for(let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0; return h.toString(36); }
+function fingerprint(b){ return b.type + ':' + hashStr(normText(blockPlainText(b))); }
+
+/* an <img> in the converted HTML -> an image block, base64 parked in D.images */
+function docxImageBlock(img){
+  const src = img.getAttribute('src');
+  if(!src) return null;
+  const b = newBlock('image');
+  b.imgId = putImage(src);
+  b.vector = /^data:image\/svg/i.test(src);
+  const alt = CLEAN(img.getAttribute('alt') || '');
+  b.caption = alt;
+  return b;
+}
+/* a paragraph's text (images stripped) -> sanitised body html, or '' if empty */
+function docxBodyHtml(el){
+  const clone = el.cloneNode(true);
+  clone.querySelectorAll('img').forEach(i => i.remove());
+  if(!CLEAN(clone.textContent)) return '';
+  return sanitizeHtml(clone.outerHTML) || '';
+}
+
+/* Transforms 2-4 run here: walk the converted DOM top-level and emit blocks.
+   Consecutive prose paragraphs (and lists) are coalesced into ONE body block so
+   a continuous body stays a single editable unit; a heading, table, image or
+   quote ends the run. Bodies taller than a page are split back apart only at
+   page boundaries later (splitTallBody), i.e. only when they flow to a new page. */
+function blocksFromDocxHtml(html){
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  const out = [];
+  let buf = [];                                                // consecutive prose/list html, merged into one body block
+  const flush = () => { if(buf.length){ const b = newBlock('body'); b.html = buf.join(''); out.push(b); buf = []; } };
+  const push = b => { if(b){ flush(); out.push(b); } };        // any non-prose block ends the current run
+  const prose = h => { if(h) buf.push(h); };
+  [...doc.body.children].forEach(el => {
+    const tag = el.tagName.toLowerCase();
+    if(/^h[1-5]$/.test(tag)){                                   // Transform 2 — section split (h1 = new page)
+      const b = newBlock(tag);
+      if(tag === 'h1'){ b.eyebrow = ''; b.text = CLEAN(el.textContent) || 'Section'; b.newPage = true; }
+      else b.text = CLEAN(el.textContent);
+      return push(b);
+    }
+    if(tag === 'h6'){ const b = newBlock('h5'); b.text = CLEAN(el.textContent); return push(b); }
+    if(tag === 'blockquote'){ const b = newBlock('quote'); b.text = CLEAN(el.textContent); b.by = ''; return push(b); }
+    if(tag === 'table'){                                        // Transform 3 — table pass (reuse paste machinery)
+      const rows = parseHtmlTable(el.outerHTML);
+      if(rows && rows.length) push(tableFromRows(rows));
+      return;
+    }
+    if(tag === 'ul' || tag === 'ol'){ return prose(sanitizeHtml(el.outerHTML)); }   // lists flow with the prose run
+    /* paragraph-level: caption, image, or prose */
+    if(el.classList.contains('caption')){                      // Transform 4 — group caption with its image
+      const cap = CLEAN(el.textContent);
+      const prev = out[out.length - 1];
+      if(!buf.length && prev && (prev.type === 'image' || prev.type === 'chart')) prev.caption = cap;
+      else if(cap) prose('<p>' + esc(cap) + '</p>');
+      return;
+    }
+    const imgs = [...el.querySelectorAll('img')];
+    if(imgs.length){                                            // Transform 4 — image pass
+      flush();
+      imgs.forEach(img => push(docxImageBlock(img)));
+      prose(docxBodyHtml(el));                                  // any text sharing the image's paragraph starts a fresh run
+      return;
+    }
+    if(!CLEAN(el.textContent)) return;                          // drop empty paragraphs
+    prose(sanitizeHtml(el.outerHTML));
+  });
+  flush();
+  return out;
+}
+/* Split a coalesced body block at paragraph boundaries into page-sized blocks —
+   the prose stays whole until it would overflow a page, then continues on the
+   next. Mirrors splitTallTable. Continuation parts carry `cont` so a later
+   re-import can merge them back for a clean, drift-free diff (see recoalesce). */
+function splitTallBody(b){
+  const { wrap, box } = probeBox();
+  wrap.innerHTML = '';
+  const el = renderBlock(b, true);
+  wrap.appendChild(el);
+  const fits = el.offsetHeight <= box.h + 0.6;
+  wrap.remove();
+  if(fits) return [b];
+  const frag = new DOMParser().parseFromString('<body>' + (b.html || '') + '</body>', 'text/html');
+  const nodes = [...frag.body.children].map(n => n.outerHTML);
+  if(nodes.length < 2) return [b];                             // a single un-splittable paragraph: leave it (overflow-flagged)
+  const parts = [];
+  let i = 0;
+  while(i < nodes.length){
+    const { wrap: w, box: bx } = probeBox();
+    const probe = renderBlock(Object.assign({}, b, { html: '' }), true);
+    w.appendChild(probe); probe.innerHTML = '';
+    let take = 0;
+    while(i + take < nodes.length){
+      probe.insertAdjacentHTML('beforeend', nodes[i + take]);
+      if(probe.offsetHeight > bx.h + 0.6 && take > 0){ probe.lastChild.remove(); break; }
+      take++;
+    }
+    w.remove();
+    if(take === 0) take = 1;
+    const part = JSON.parse(JSON.stringify(b));
+    part.id = uid();
+    part.html = nodes.slice(i, i + take).join('');
+    if(parts.length) part.cont = true;
+    parts.push(part);
+    i += take;
+  }
+  return parts;
+}
+/* expand every body block into its page-sized parts (non-body pass through) */
+function expandTallBodies(blocks){
+  const out = [];
+  blocks.forEach(b => { if(b.type === 'body') out.push(...splitTallBody(b)); else out.push(b); });
+  return out;
+}
+/* the inverse for diffing: merge page-split continuation parts back into one
+   logical body so re-import compares whole bodies, not shifting page fragments.
+   Clones bodies so the live document is never mutated during a diff. */
+function recoalesce(blocks){
+  const out = [];
+  (blocks || []).forEach(b => {
+    const prev = out[out.length - 1];
+    if(b.type === 'body' && b.cont && prev && prev.type === 'body') prev.html = (prev.html || '') + (b.html || '');
+    else if(b.type === 'body'){ const c = Object.assign({}, b); delete c.cont; out.push(c); }
+    else out.push(b);
+  });
+  return out;
+}
+
+/* Cleanup-diagnostics: a Low/Medium/High read on manual work, shown after a
+   full import (mirrors the review panel's visual language). */
+function showDocxDiagnostics(blocks){
+  const panel = $('docxPanel');
+  const issues = [];
+  let empties = 0, longp = 0, big = 0;
+  blocks.forEach(b => {
+    if(b.type === 'table' && (!b.rows.length || b.rows.every(r => r.every(c => !CLEAN(c))))) empties++;
+    if(b.type === 'body' && htmlToText(b.html).length > 1200) longp++;
+    if(b.type === 'image' && (b.w || 0) > 2200) big++;
+  });
+  if(empties) issues.push(empties + ' empty table' + (empties > 1 ? 's' : ''));
+  if(longp)   issues.push(longp + ' very long paragraph' + (longp > 1 ? 's' : ''));
+  if(big)     issues.push(big + ' oversized image' + (big > 1 ? 's' : ''));
+  const load = issues.length === 0 ? 'low' : issues.length <= 2 ? 'medium' : 'high';
+  panel.hidden = false;
+  panel.className = 'docx-diag';
+  panel.innerHTML = `<span class="dd-badge ${load}">${load} cleanup</span>`
+    + `<span>${issues.length ? esc(issues.join(', ')) : 'Looks clean — no obvious cleanup needed'}</span>`;
+}
+
+/* First import into an empty (or explicitly overwritten) report = full populate. */
+function docxFullPopulate(blocks, fileName){
+  blocks = expandTallBodies(blocks);                           // break coalesced bodies only where they'd flow to a new page
+  blocks.forEach(b => { b.fp = fingerprint(b); });
+  D.blocks = blocks;
+  D.meta.importSource = { fileName: fileName, importedAt: Date.now() };
+  sel = blocks[0] ? blocks[0].id : null;
+  commit();
+  showDocxDiagnostics(blocks);
+  toast('Imported ' + blocks.length + ' blocks from ' + fileName);
+}
+
+/* ---------- Phase 2 — incremental re-import (diff-merge) ----------
+   A re-import of an already-imported report merges only the changed
+   paragraphs, preserving each surviving block's id, styling and layout.
+   The new Word file is authoritative for structure and order. */
+
+/* Dice coefficient over character bigrams — a cheap, stable fuzzy-text ratio
+   in [0,1] with no dependencies, used to spot "edited" (vs replaced) blocks. */
+function bigrams(s){ const g = []; for(let i = 0; i < s.length - 1; i++) g.push(s.slice(i, i + 2)); return g; }
+function simRatio(a, b){
+  if(a === b) return 1;
+  if(a.length < 2 || b.length < 2) return a === b ? 1 : 0;
+  const A = bigrams(a), B = bigrams(b), map = new Map();
+  A.forEach(g => map.set(g, (map.get(g) || 0) + 1));
+  let inter = 0;
+  B.forEach(g => { const c = map.get(g) || 0; if(c > 0){ inter++; map.set(g, c - 1); } });
+  return (2 * inter) / (A.length + B.length);
+}
+
+/* split a block list into sections at each h1; a run before the first h1 is an
+   unnamed "preamble" section (head === null). The h1 is blocks[0] of a section. */
+function splitSections(blocks){
+  const secs = [];
+  let cur = { head: null, blocks: [] };
+  (blocks || []).forEach(b => {
+    if(b.type === 'h1'){
+      if(cur.blocks.length) secs.push(cur);
+      cur = { head: b, blocks: [b] };
+    } else cur.blocks.push(b);
+  });
+  if(cur.blocks.length) secs.push(cur);
+  return secs;
+}
+/* how well two sections correspond (by their h1 title), 0..1 */
+function secScore(ns, os){
+  if(!ns.head && !os.head) return 1;                 // both preamble
+  if(!ns.head || !os.head) return 0;
+  if(fingerprint(ns.head) === fingerprint(os.head)) return 1;
+  return simRatio(normText(blockPlainText(ns.head)), normText(blockPlainText(os.head)));
+}
+/* LCS anchor pairs on exact equality — indices [i,j] of the longest common
+   subsequence, used to lock unchanged blocks in place before diffing the gaps. */
+function lcsIdx(A, B){
+  const n = A.length, m = B.length;
+  const dp = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
+  for(let i = n - 1; i >= 0; i--) for(let j = m - 1; j >= 0; j--)
+    dp[i][j] = A[i] === B[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+  const out = []; let i = 0, j = 0;
+  while(i < n && j < m){
+    if(A[i] === B[j]){ out.push([i, j]); i++; j++; }
+    else if(dp[i + 1][j] >= dp[i][j + 1]) i++; else j++;
+  }
+  return out;
+}
+/* align one matched section's old vs new blocks, appending ops in new-doc order.
+   Exact fingerprint matches anchor as "keep"; within each gap, same-type blocks
+   with close text pair as "edit", the rest are "add" (new) / "remove" (old). */
+const DOCX_EDIT_SIM = 0.4;                            // min similarity to call it an edit, not add+remove
+function alignSection(oldArr, newArr, ops){
+  const ofp = oldArr.map(fingerprint), nfp = newArr.map(fingerprint);
+  const emitGap = (oGap, nGap) => {
+    const usedO = new Set();
+    nGap.forEach(nb => {
+      let best = -1, bs = 0;
+      oGap.forEach((ob, k) => {
+        if(usedO.has(k) || ob.type !== nb.type) return;
+        const s = simRatio(normText(blockPlainText(ob)), normText(blockPlainText(nb)));
+        if(s > bs){ bs = s; best = k; }
+      });
+      if(best >= 0 && bs >= DOCX_EDIT_SIM){ usedO.add(best); ops.push({ kind: 'edit', block: oGap[best], to: nb, accepted: true }); }
+      else ops.push({ kind: 'add', to: nb, accepted: true });
+    });
+    oGap.forEach((ob, k) => { if(!usedO.has(k)) ops.push({ kind: 'remove', block: ob, accepted: true }); });
+  };
+  const anchors = lcsIdx(ofp, nfp);
+  let oi = 0, nj = 0;
+  anchors.forEach(([ai, bj]) => {
+    emitGap(oldArr.slice(oi, ai), newArr.slice(nj, bj));
+    ops.push({ kind: 'keep', block: oldArr[ai] });
+    oi = ai + 1; nj = bj + 1;
+  });
+  emitGap(oldArr.slice(oi), newArr.slice(nj));
+}
+/* build the full merge plan: matched sections diff block-by-block, unmatched new
+   sections are all-added, unmatched old sections are all-removed (appended last). */
+function docxDiff(oldBlocks, newBlocks){
+  oldBlocks = recoalesce(oldBlocks); newBlocks = recoalesce(newBlocks);   // diff whole bodies, not page fragments
+  const oldSecs = splitSections(oldBlocks), newSecs = splitSections(newBlocks);
+  const usedOld = new Set(), ops = [];
+  newSecs.forEach(ns => {
+    let best = -1, bs = 0;
+    oldSecs.forEach((os, i) => { if(usedOld.has(i)) return; const s = secScore(ns, os); if(s > bs){ bs = s; best = i; } });
+    if(best >= 0 && bs >= 0.6){ usedOld.add(best); alignSection(oldSecs[best].blocks, ns.blocks, ops); }
+    else ns.blocks.forEach(nb => ops.push({ kind: 'add', to: nb, accepted: true }));
+  });
+  oldSecs.forEach((os, i) => { if(!usedOld.has(i)) os.blocks.forEach(ob => ops.push({ kind: 'remove', block: ob, accepted: true })); });
+  const counts = { edit: 0, add: 0, remove: 0 };
+  ops.forEach(op => { if(op.kind in counts) counts[op.kind]++; });
+  return { ops, counts };
+}
+/* copy only the content fields from the new block onto the surviving old block,
+   so its styling, spacing, page-break flags and id are untouched. */
+function applyEditContent(o, n){
+  switch(o.type){
+    case 'body':  o.html = n.html; break;
+    case 'h1':    o.text = n.text; if('eyebrow' in n) o.eyebrow = n.eyebrow; break;
+    case 'h2': case 'h3': case 'h4': case 'h5': case 'label': o.text = n.text; break;
+    case 'quote': o.text = n.text; o.by = n.by; break;
+    case 'table': o.head = n.head; o.rows = n.rows; normTable(o); break;   // normTable keeps widths/merges when shapes still fit
+    case 'image': o.caption = n.caption; break;
+    case 'stat':  o.v = n.v; o.l = n.l; o.note = n.note; break;
+    case 'stats': o.items = n.items; break;
+    case 'blurb': o.title = n.title; o.body = n.body; break;
+  }
+}
+/* materialise the plan honouring each op's accepted flag, re-fingerprint every
+   surviving block, then commit. Declined edits keep old content; declined
+   removals retain the block; declined additions are dropped. */
+function applyDocxMerge(plan, fileName){
+  const out = [];
+  plan.ops.forEach(op => {
+    if(op.kind === 'keep') out.push(op.block);
+    else if(op.kind === 'edit'){ if(op.accepted) applyEditContent(op.block, op.to); out.push(op.block); }
+    else if(op.kind === 'add'){ if(op.accepted) out.push(op.to); }
+    else if(op.kind === 'remove'){ if(!op.accepted) out.push(op.block); }
+  });
+  const expanded = expandTallBodies(out);                      // re-split merged bodies at page boundaries before storing
+  expanded.forEach(b => { b.fp = fingerprint(b); });
+  D.blocks = expanded;
+  D.meta.importSource = { fileName: fileName, importedAt: Date.now() };
+  sel = expanded[0] ? expanded[0].id : null;
+  commit();
+  const panel = $('docxPanel'); panel.hidden = true; panel.innerHTML = '';
+  const c = plan.counts;
+  toast('Merged ' + [c.edit && c.edit + ' edited', c.add && c.add + ' added', c.remove && c.remove + ' removed'].filter(Boolean).join(', ') || 'no changes');
+}
+/* the mandatory review panel: one row per change, each skippable, then Apply /
+   Replace all / Cancel. Reuses the .docx-panel styling shipped with Phase 1. */
+function renderDocxReview(plan, fileName, newBlocks){
+  const panel = $('docxPanel');
+  const changes = plan.ops.filter(op => op.kind !== 'keep');
+  if(!changes.length){
+    D.meta.importSource.importedAt = Date.now(); save();
+    panel.hidden = false; panel.className = 'docx-diag';
+    panel.innerHTML = `<span class="dd-badge low">up to date</span><span>No changes to merge from ${esc(fileName)}</span>`;
+    return;
+  }
+  const tag = { edit: 'edited', add: 'added', remove: 'removed' };
+  const label = op => { const b = op.to || op.block; return esc(CLEAN(blockPlainText(b)).slice(0, 90) || ('(' + b.type + ')')); };
+  const rows = changes.map((op, i) => `<div class="docx-row" data-i="${i}">`
+    + `<span class="dr-tag ${tag[op.kind]}">${tag[op.kind]}</span>`
+    + `<span class="dr-text">${label(op)}</span>`
+    + `<button class="dr-skip" title="Skip this change" data-i="${i}">×</button></div>`).join('');
+  const c = plan.counts;
+  panel.hidden = false;
+  panel.className = 'docx-panel';
+  panel.innerHTML = `<div class="dp-head">Review changes <span class="dp-sum">${c.edit} edited · ${c.add} added · ${c.remove} removed</span></div>`
+    + `<div class="dp-list">${rows}</div>`
+    + `<div class="dp-foot"><button class="btn btn-primary btn-sm" data-docx-apply style="flex:1">Apply changes</button>`
+    + `<button class="btn btn-ghost btn-sm" data-docx-replace title="Discard the report and repopulate from this file">Replace all</button>`
+    + `<button class="btn btn-ghost btn-sm" data-docx-cancel>Cancel</button></div>`;
+  panel.querySelectorAll('.dr-skip').forEach(btn => btn.onclick = () => {
+    const i = +btn.dataset.i; changes[i].accepted = !changes[i].accepted;
+    btn.closest('.docx-row').classList.toggle('off', !changes[i].accepted);
+  });
+  panel.querySelector('[data-docx-apply]').onclick = () => applyDocxMerge(plan, fileName);
+  panel.querySelector('[data-docx-cancel]').onclick = () => { panel.hidden = true; panel.innerHTML = ''; };
+  panel.querySelector('[data-docx-replace]').onclick = () => {
+    if(!confirm('Replace the whole report with this file? Existing styling and layout will be lost.')) return;
+    delete D.meta.importSource;
+    docxFullPopulate(newBlocks, fileName);
+  };
+}
+
+/* Re-import of an already-imported report: diff against the current blocks and
+   open the review panel. Empty/first imports never reach here (see importDocxFile). */
+function docxReimport(blocks, fileName){
+  renderDocxReview(docxDiff(D.blocks || [], blocks), fileName, blocks);
+}
+
+async function importDocxFile(file){
+  if(!window.mammoth){ toast('The .docx importer failed to load'); return; }
+  const btn = $('docxBtn');
+  btn.disabled = true;
+  try{
+    const buf = await file.arrayBuffer();
+    const res = await mammoth.convertToHtml({ arrayBuffer: buf }, { styleMap: DOCX_STYLE_MAP });
+    const blocks = blocksFromDocxHtml(res.value);
+    if(!blocks.length){ toast('No content found in that .docx'); return; }
+    if(D.meta && D.meta.importSource) return docxReimport(blocks, file.name);
+    if(D.blocks && D.blocks.length && !confirm('Importing will replace the current report content. Continue?')) return;
+    docxFullPopulate(blocks, file.name);
+  }catch(err){
+    console.error('.docx import failed', err);
+    toast('Could not read that .docx');
+  }finally{
+    btn.disabled = false;
+  }
+}
+
+$('docxBtn').onclick = () => $('docxIn').click();
+$('docxIn').onchange = () => {
+  const f = $('docxIn').files[0];
+  if(f) importDocxFile(f);
+  $('docxIn').value = '';
+};
 
 document.addEventListener('paste', e => {
   if($('view-editor').hidden) return;
